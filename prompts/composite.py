@@ -1,5 +1,4 @@
 from langchain_core.prompts import PromptTemplate
-from langchain_community.chat_models import ChatOllama
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_groq import ChatGroq
 from langchain.schema import Document
@@ -23,9 +22,25 @@ ZILLIZ_TOKEN     = os.environ["ZILLIZ_API_KEY"]
 CLUSTER_ENDPOINT = "https://in03-5223ff782a72af1.serverless.aws-eu-central-1.cloud.zilliz.com"
 COLLECTION_NAME  = "graph_rag_arxiv"
 api = os.getenv("GROQ_API_KEY")
+model = SentenceTransformer("BAAI/bge-base-en-v1.5")
 
 
-prompt = PromptTemplate(
+llm = ChatGroq(
+    api_key = api,
+    model = LLM_NAME,
+    temperature=0.1
+)
+mc = MilvusClient(
+    uri=CLUSTER_ENDPOINT,
+    token=ZILLIZ_TOKEN
+)
+graph = Neo4jGraph(
+    url=os.getenv("NEO4J_URI"),
+    username=os.getenv("NEO4J_USERNAME"),
+    password=os.getenv("NEO4J_PASSWORD"),
+    database="40d4e79a"
+)
+comp_prompt = PromptTemplate(
     template="""You are an assistant for question-answering tasks. 
     Use the following pieces of retrieved context from a vector store and a graph database to answer the question. If you don't know the answer, just say that you don't know. 
     Use three sentences maximum and keep the answer concise:
@@ -37,8 +52,102 @@ prompt = PromptTemplate(
     input_variables=["question", "context", "graph_context"],
 )
 
-composite_chain = prompt | llm | StrOutputParser()
+composite_chain = comp_prompt | llm | StrOutputParser()
 
+# ========================================================================
+
+grd_prompt = PromptTemplate(
+    template="""You are a grader assessing relevance 
+    of a retrieved document to a user question. If the document contains keywords related to the user question, 
+    grade it as relevant. It does not need to be a stringent test. The goal is to filter out erroneous retrievals. 
+    
+    Give a binary score 'yes' or 'no' score to indicate whether the document is relevant to the question.
+    Provide the binary score as a JSON with a single key 'score' and no premable or explaination.
+     
+    Here is the retrieved document: 
+    {document}
+    
+    Here is the user question: 
+    {question}
+    """,
+    input_variables=["question", "document"],
+)
+
+retrieval_grader = grd_prompt | llm | JsonOutputParser()
+
+cypher_prompt = PromptTemplate(
+    template="""You are an expert at generating Cypher queries for Neo4j.
+    Use the following schema to generate a Cypher query that answers the given question.
+    Make the query flexible by using case-insensitive matching and partial string matching where appropriate.
+    Focus on searching paper titles as they contain the most relevant information.
+    
+    Schema:
+    {schema}
+    
+    Question: {question}
+    
+    Cypher Query:""",
+    input_variables=["schema", "question"],
+)
+
+qa_prompt = PromptTemplate(
+    template="""You are an assistant for question-answering tasks. 
+    Use the following Cypher query results to answer the question. If you don't know the answer, just say that you don't know. 
+    Use three sentences maximum and keep the answer concise. If topic information is not available, focus on the paper titles.
+    
+    Question: {question} 
+    Cypher Query: {query}
+    Query Results: {context} 
+    
+    Answer:""",
+    input_variables=["question", "query", "context"],
+)
+
+graph_rag_chain = GraphCypherQAChain.from_llm(
+    cypher_llm = llm,
+    qa_llm=llm,
+    validate_cypher=True,
+    graph=graph,
+    verbose=True,
+    return_intermediate_steps=True,
+    return_direct=True,
+    cypher_prompt=cypher_prompt,
+    qa_prompt=qa_prompt,
+    allow_dangerous_requests=True
+)
+
+hal_prompt = PromptTemplate(
+    template="""You are a grader assessing whether 
+    an answer is grounded in / supported by a set of facts. Give a binary score 'yes' or 'no' score to indicate 
+    whether the answer is grounded in / supported by a set of facts. Provide the binary score as a JSON with a 
+    single key 'score' and no preamble or explanation.
+    
+    Here are the facts:
+    {documents} 
+
+    Here is the answer: 
+    {generation}
+    """,
+    input_variables=["generation", "documents"],
+)
+hallucination_grader = hal_prompt | llm | JsonOutputParser()
+
+ans_prompt = PromptTemplate(
+    template="""You are a grader assessing whether an 
+    answer is useful to resolve a question. Give a binary score 'yes' or 'no' to indicate whether the answer is 
+    useful to resolve a question. Provide the binary score as a JSON with a single key 'score' and no preamble or explanation.
+     
+    Here is the answer:
+    {generation} 
+
+    Here is the question: {question}
+    """,
+    input_variables=["generation", "question"],
+)
+
+answer_grader = ans_prompt | llm | JsonOutputParser()
+
+web_search_tool = TavilySearchResults(k=3)
 class GraphState(TypedDict):
     """
     Represents the state of our graph.
@@ -68,11 +177,30 @@ def retrieve(state):
         state (dict): New key added to state, documents, that contains retrieved documents
     """
     print("---RETRIEVE---")
-    question = state["question"]
+    retrieved_docs = []
 
+    question = state["question"]
+    query_vector = model.encode(
+        [question],
+        normalize_embeddings=True
+    )[0].tolist()
+
+    results = mc.search(
+        data=[query_vector],
+        collection_name=COLLECTION_NAME,
+        limit=5,
+        output_fields=["text", "source", "title"]
+    )
+    for hits in results:
+        for hit in hits:
+            retrieved_docs.append({
+                "text": hit["entity"]["text"],
+                "title": hit["entity"]["title"],
+                "source":hit["entity"]["source"],
+                "score": hit["distance"]
+            })
     # Retrieval
-    documents = retriever.invoke(question)
-    return {"documents": documents, "question": question}
+    return {"documents": retrieved_docs, "question": question}
 
 def generate(state):
     """
@@ -327,56 +455,3 @@ for output in app.stream(inputs):
         pprint(f"Finished running: {key}:")
 pprint(value["generation"])
 
-# This is for the vector store retrieval and holds vector context 
-
-llm = ChatGroq(
-    api_key = api,
-    model = LLM_NAME,
-    temperature=0.1
-)
-mc = MilvusClient(
-    uri=CLUSTER_ENDPOINT,
-    token=ZILLIZ_TOKEN
-)
-
-model = SentenceTransformer("BAAI/bge-base-en-v1.5")
-
-question = "llm agent memory"
-
-query_vector = model.encode(
-    [question],
-    normalize_embeddings=True
-)[0].tolist()
-
-retrieved_docs = []
-
-results = mc.search(
-    collection_name=COLLECTION_NAME,
-    data=[query_vector],
-    limit=5,
-    output_fields=["text", "source", "title"]
-)
-
-for hits in results:
-    for hit in hits:
-        retrieved_docs.append({
-            "text": hit["entity"]["text"],
-            "title": hit["entity"]["title"],
-            "source": hit["entity"]["source"],
-            "score": hit["distance"]
-        })
-
-question_router = prompt | llm | JsonOutputParser()
-
-vector_context = question_router.invoke({"question": question})
-
-print(vector_context)
-
-# This is for the grpah context retrieval and holds graph content
-
-# graph = Neo4jGraph(
-#     url=os.getenv("NEO4J_URI"),
-#     username=os.getenv("NEO4J_USERNAME"),
-#     password=os.getenv("NEO4J_PASSWORD"),
-#     database="40d4e79a"
-# )
