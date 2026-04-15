@@ -1,7 +1,7 @@
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_groq import ChatGroq
-from langchain.schema import Document
+from langchain_core.documents import Document
 from langchain_community.graphs import Neo4jGraph
 from langchain_classic.chains import GraphCypherQAChain
 from langchain_community.tools.tavily_search import TavilySearchResults
@@ -20,6 +20,7 @@ _ = load_dotenv(find_dotenv())
 LLM_NAME = "openai/gpt-oss-120b"
 ZILLIZ_TOKEN     = os.environ["ZILLIZ_API_KEY"]
 CLUSTER_ENDPOINT = "https://in03-5223ff782a72af1.serverless.aws-eu-central-1.cloud.zilliz.com"
+tavily = os.getenv("TAVILY_API_KEY")
 COLLECTION_NAME  = "graph_rag_arxiv"
 api = os.getenv("GROQ_API_KEY")
 model = SentenceTransformer("BAAI/bge-base-en-v1.5")
@@ -148,6 +149,28 @@ ans_prompt = PromptTemplate(
 answer_grader = ans_prompt | llm | JsonOutputParser()
 
 web_search_tool = TavilySearchResults(k=3)
+
+router_prompt = PromptTemplate(
+    template="""You are an expert at routing a user question to the most appropriate data source. 
+    You have three options:
+    1. 'vectorstore': Use for questions about LLM agents, prompt engineering, and adversarial attacks.
+    2. 'graphrag': Use for questions that involve relationships between entities, such as authors, papers, and topics, or when the question requires understanding connections between concepts.
+    3. 'web_search': Use for all other questions or when current information is needed.
+
+    You do not need to be stringent with the keywords in the question related to these topics. 
+    Choose the most appropriate option based on the nature of the question.
+
+    Return a JSON with a single key 'datasource' and no preamble or explanation. 
+    The value should be one of: 'vectorstore', 'graphrag', or 'web_search'.
+    
+    Question to route: 
+    {question}
+    """,
+    input_variables=["question"],
+)
+
+question_router = router_prompt | llm | JsonOutputParser()
+
 class GraphState(TypedDict):
     """
     Represents the state of our graph.
@@ -249,7 +272,7 @@ def grade_documents(state):
     web_search = "No"
     for d in documents:
         score = retrieval_grader.invoke(
-            {"question": question, "document": d.page_content}
+            {"question": question, "document": d["text"]}
         )
         grade = score["score"]
         # Document relevant
